@@ -7,3 +7,6 @@ dist/
 .venv/
 venv/
 .env
+*.db
+
+

@@ -28,8 +28,9 @@ class ApiResource(RoutingMixin, ParamMixin, QueryingMixin, PaginationMixin, Meth
     ``ApiFactory(...).register_resource(...)``.
 
     Nested resources can be declared with ``parent_resource``, ``parent_fk``,
-    and optionally ``parent_defaults`` / ``one_to_one``; registration then
+    and optionally ``parent_defaults`` / ``singleton``; registration then
     resolves the parent class from the factory's registered resources.
+    ``one_to_one`` remains a compatibility alias for ``singleton``.
     """
 
     schema: Optional[type[Schema]] = None
@@ -52,7 +53,9 @@ class ApiResource(RoutingMixin, ParamMixin, QueryingMixin, PaginationMixin, Meth
     # Map child model fields to attributes on their nested parent.
     parent_defaults: Optional[Dict[str, Any]] = None
     parent_param: Optional[str] = None
-    one_to_one: bool = False
+    singleton: bool = False
+    # Deprecated class-level alias retained for backwards compatibility.
+    one_to_one: Optional[bool] = None
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -148,11 +151,23 @@ class ApiResource(RoutingMixin, ParamMixin, QueryingMixin, PaginationMixin, Meth
                 payload[name] = getattr(obj, "id", obj)
         return payload
 
-    def _one_to_one_query(self):
+    def _singleton_query(self):
         try:
             return self._build_query()
         except FilterError as exc:
             raise ApiError(400, str(exc)) from exc
+
+    def _nested_parent_query(self):
+        contexts = getattr(self, "_nested_parent_contexts", ())
+        if not contexts:
+            return None
+
+        query = self.db.session.query(self.model)
+        for field, value in self._parent_filters().items():
+            column = getattr(self.model, field, None)
+            if column is not None:
+                query = query.filter(column == value)
+        return query
 
     def _collection_get(self):
         try:
@@ -177,10 +192,10 @@ class ApiResource(RoutingMixin, ParamMixin, QueryingMixin, PaginationMixin, Meth
 
     def get(self, **kwargs):
         self._resolve_kwargs(**kwargs)
-        one_to_one = getattr(self, "_nested_one_to_one", False)
-        pk = None if one_to_one else kwargs.get(self.pk_field)
-        if one_to_one:
-            query = self._one_to_one_query()
+        singleton = getattr(self, "_nested_singleton", False)
+        pk = None if singleton else kwargs.get(self.pk_field)
+        if singleton:
+            query = self._singleton_query()
             obj = query.first()
             if obj is None:
                 raise ApiError(404, f"{self.model.__name__} not found")
@@ -202,11 +217,13 @@ class ApiResource(RoutingMixin, ParamMixin, QueryingMixin, PaginationMixin, Meth
         if not self.allow_update:
             raise ApiError(405, "Method not allowed")
         self._resolve_kwargs(**kwargs)
-        one_to_one = getattr(self, "_nested_one_to_one", False)
-        pk = None if one_to_one else kwargs.get(self.pk_field)
+        singleton = getattr(self, "_nested_singleton", False)
+        query = self._nested_parent_query()
+        pk = None if singleton else kwargs.get(self.pk_field)
         if pk is None:
-            if one_to_one:
-                query = self._one_to_one_query()
+            if singleton:
+                if query is None:
+                    query = self._singleton_query()
                 obj = query.first()
                 if obj is None:
                     raise ApiError(404, f"{self.model.__name__} not found")
@@ -217,17 +234,21 @@ class ApiResource(RoutingMixin, ParamMixin, QueryingMixin, PaginationMixin, Meth
                 )
             raise ApiError(400, f"Missing {self.pk_field}")
         payload = self._inject_parent_values(request.get_json(silent=True) or {})
-        return self.service.update(pk, payload, pk_field=self.pk_field, partial=False)
+        return self.service.update(
+            pk, payload, pk_field=self.pk_field, partial=False, query=query
+        )
 
     def patch(self, **kwargs):
         if not self.allow_update:
             raise ApiError(405, "Method not allowed")
         self._resolve_kwargs(**kwargs)
-        one_to_one = getattr(self, "_nested_one_to_one", False)
-        pk = None if one_to_one else kwargs.get(self.pk_field)
+        singleton = getattr(self, "_nested_singleton", False)
+        query = self._nested_parent_query()
+        pk = None if singleton else kwargs.get(self.pk_field)
         if pk is None:
-            if one_to_one:
-                query = self._one_to_one_query()
+            if singleton:
+                if query is None:
+                    query = self._singleton_query()
                 obj = query.first()
                 if obj is None:
                     raise ApiError(404, f"{self.model.__name__} not found")
@@ -238,21 +259,25 @@ class ApiResource(RoutingMixin, ParamMixin, QueryingMixin, PaginationMixin, Meth
                 )
             raise ApiError(400, f"Missing {self.pk_field}")
         payload = self._inject_parent_values(request.get_json(silent=True) or {})
-        return self.service.update(pk, payload, pk_field=self.pk_field, partial=True)
+        return self.service.update(
+            pk, payload, pk_field=self.pk_field, partial=True, query=query
+        )
 
     def delete(self, **kwargs):
         if not self.allow_delete:
             raise ApiError(405, "Method not allowed")
         self._resolve_kwargs(**kwargs)
-        one_to_one = getattr(self, "_nested_one_to_one", False)
-        pk = None if one_to_one else kwargs.get(self.pk_field)
+        singleton = getattr(self, "_nested_singleton", False)
+        query = self._nested_parent_query()
+        pk = None if singleton else kwargs.get(self.pk_field)
         if pk is None:
-            if one_to_one:
-                query = self._one_to_one_query()
+            if singleton:
+                if query is None:
+                    query = self._singleton_query()
                 obj = query.first()
                 if obj is None:
                     raise ApiError(404, f"{self.model.__name__} not found")
                 pk = getattr(obj, self.pk_field)
                 return self.service.delete(pk, pk_field=self.pk_field, query=query)
             raise ApiError(400, f"Missing {self.pk_field}")
-        return self.service.delete(pk, pk_field=self.pk_field)
+        return self.service.delete(pk, pk_field=self.pk_field, query=query)

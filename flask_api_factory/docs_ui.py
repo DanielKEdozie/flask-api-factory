@@ -4,6 +4,7 @@ Assets are loaded from CDNs so the package stays small and works without a
 build step. The pages point at the factory's OpenAPI JSON endpoint.
 """
 
+import json
 from html import escape
 
 _SWAGGER_CSS = "https://unpkg.com/swagger-ui-dist@5/swagger-ui.css"
@@ -25,7 +26,7 @@ def swagger_page(title: str, spec_url: str) -> str:
   <script src="{_SWAGGER_JS}"></script>
   <script>
     window.ui = SwaggerUIBundle({{
-      url: {spec_url!r},
+      url: {json.dumps(spec_url)},
       dom_id: '#swagger-ui',
       deepLinking: true,
       presets: [SwaggerUIBundle.presets.apis, SwaggerUIBundle.SwaggerUIStandalonePreset],

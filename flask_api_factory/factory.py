@@ -12,6 +12,14 @@ from flask_api_factory.resource import ApiResource
 from flask_api_factory.routing import normalize_prefix
 
 
+def _resolve_singleton(singleton: bool, one_to_one: Optional[bool]) -> bool:
+    if one_to_one is None:
+        return singleton
+    if singleton and not one_to_one:
+        raise ValueError("singleton=True conflicts with one_to_one=False")
+    return one_to_one
+
+
 class ResourceRegistration:
     """A registered resource and the factory context used to nest children."""
 
@@ -23,7 +31,7 @@ class ResourceRegistration:
         endpoint: str,
         pk_field: str,
         pk_type: str,
-        one_to_one: bool = False,
+        singleton: bool = False,
     ):
         self.factory = factory
         self.resource = resource
@@ -31,7 +39,12 @@ class ResourceRegistration:
         self.endpoint = endpoint
         self.pk_field = pk_field
         self.pk_type = pk_type
-        self.one_to_one = one_to_one
+        self.singleton = singleton
+
+    @property
+    def one_to_one(self) -> bool:
+        """Deprecated alias for :attr:`singleton`."""
+        return self.singleton
 
     def nested_resource(
         self,
@@ -42,10 +55,15 @@ class ResourceRegistration:
         defaults: Optional[Dict[str, Any]] = None,
         param_name: Optional[str] = None,
         endpoint: Optional[str] = None,
-        one_to_one: bool = False,
+        singleton: bool = False,
+        one_to_one: Optional[bool] = None,
         **rule_options,
     ) -> "ResourceRegistration":
-        """Register a child resource beneath this resource's detail route."""
+        """Register a child resource beneath this resource's detail route.
+
+        ``singleton=True`` creates one child per parent without a child-ID
+        route. ``one_to_one`` is accepted as a compatibility alias.
+        """
         return self.factory._register_nested_resource(
             parent=self,
             resource=resource,
@@ -54,7 +72,7 @@ class ResourceRegistration:
             defaults=defaults,
             param_name=param_name,
             endpoint=endpoint,
-            one_to_one=one_to_one,
+            singleton=_resolve_singleton(singleton, one_to_one),
             **rule_options,
         )
 
@@ -76,7 +94,7 @@ class ApiFactory:
         api = ApiFactory(app, db=db, url_prefix="/api")
         users = api.register_resource(UserResource, path="/users")
         users.nested_resource(
-            ProfileResource, path="profile", fk="user_id", one_to_one=True
+            ProfileResource, path="profile", fk="user_id", singleton=True
         )
         api.register_resource(LoginResource, urls=["/auth/login"])  # explicit URLs
     """
@@ -245,7 +263,10 @@ class ApiFactory:
                 defaults=getattr(resource, "parent_defaults", None),
                 param_name=getattr(resource, "parent_param", None),
                 endpoint=endpoint,
-                one_to_one=getattr(resource, "one_to_one", False),
+                singleton=_resolve_singleton(
+                    getattr(resource, "singleton", False),
+                    getattr(resource, "one_to_one", None),
+                ),
                 detail=detail,
                 **rule_options,
             )
@@ -296,7 +317,7 @@ class ApiFactory:
                 detail=(
                     is_api_resource
                     and (
-                        getattr(resource, "_nested_one_to_one", False)
+                        getattr(resource, "_nested_singleton", False)
                         or f":{getattr(resource, 'pk_field', 'id')}>" in rule
                         or f"<{getattr(resource, 'pk_field', 'id')}>" in rule
                     )
@@ -311,7 +332,7 @@ class ApiFactory:
             ep,
             getattr(resource, "pk_field", "id"),
             getattr(resource, "pk_type", "int"),
-            bool(getattr(resource, "_nested_one_to_one", False)),
+            bool(getattr(resource, "_nested_singleton", False)),
         )
         self._registrations.append(registration)
         return registration
@@ -347,15 +368,17 @@ class ApiFactory:
         defaults: Optional[Dict[str, Any]] = None,
         param_name: Optional[str] = None,
         endpoint: Optional[str] = None,
-        one_to_one: bool = False,
+        singleton: bool = False,
+        one_to_one: Optional[bool] = None,
         **rule_options,
     ) -> ResourceRegistration:
         """Register a nested resource with an explicitly selected parent.
 
         ``fk`` names the child's parent foreign-key field. ``defaults`` may
         map child fields to attributes on the parent (for example
-        ``{"user_id": "id"}``). A one-to-one resource uses a singular URL
-        without a child primary-key segment.
+        ``{"user_id": "id"}``). A singleton resource uses a singular URL
+        without a child primary-key segment. ``one_to_one`` remains a
+        compatibility alias for ``singleton``.
         """
         return self._register_nested_resource(
             parent=self._find_registration(parent),
@@ -365,7 +388,7 @@ class ApiFactory:
             defaults=defaults,
             param_name=param_name,
             endpoint=endpoint,
-            one_to_one=one_to_one,
+            singleton=_resolve_singleton(singleton, one_to_one),
             **rule_options,
         )
 
@@ -379,7 +402,7 @@ class ApiFactory:
         defaults: Optional[Dict[str, Any]],
         param_name: Optional[str],
         endpoint: Optional[str],
-        one_to_one: bool,
+        singleton: bool,
         detail: Optional[bool] = None,
         **rule_options,
     ) -> ResourceRegistration:
@@ -419,18 +442,18 @@ class ApiFactory:
                 raise ValueError(
                     f"{parent.resource.__name__} has no parent attribute {source!r}"
                 )
-        if not parent.one_to_one and param in (
+        if not parent.singleton and param in (
             getattr(parent.resource, "route_params", {}) or {}
         ):
             raise ValueError(
                 f"Nested route parameter {param!r} conflicts with an ancestor parameter"
             )
-        if not parent.one_to_one and param == getattr(resource, "pk_field", "id"):
+        if not parent.singleton and param == getattr(resource, "pk_field", "id"):
             raise ValueError(
                 f"Nested route parameter {param!r} conflicts with the child primary key"
             )
-        if one_to_one and detail:
-            raise ValueError("one_to_one resources cannot register a child detail route")
+        if singleton and detail:
+            raise ValueError("singleton resources cannot register a child detail route")
         db = self._db
         if db is None:
             raise RuntimeError("A db instance is required to register nested ApiResource resources")
@@ -517,7 +540,7 @@ class ApiFactory:
                     query = query.filter(column == parent_value)
             return query.first()
 
-        param = None if parent.one_to_one else param
+        param = None if parent.singleton else param
         route_params = {
             **dict(getattr(parent.resource, "route_params", {}) or {}),
             **dict(getattr(resource, "route_params", {}) or {}),
@@ -554,7 +577,7 @@ class ApiFactory:
             "route_params": route_params,
             "resolve_params": resolve_params,
             "_nested_parent_contexts": tuple(nested_contexts),
-            "_nested_one_to_one": one_to_one,
+            "_nested_singleton": singleton,
         }
         registered_resource = type(
             f"{resource.__name__}Nested{len(self._registrations) + 1}",
@@ -564,13 +587,13 @@ class ApiFactory:
 
         parent_detail_path = (
             parent.path
-            if parent.one_to_one
+            if parent.singleton
             else f"{parent.path}/<{parent.pk_type}:{param}>"
         )
         nested_path = f"{parent_detail_path}/{path.strip('/')}"
-        allowed_detail = detail if detail is not None else not one_to_one
+        allowed_detail = detail if detail is not None else not singleton
         methods = None
-        if one_to_one:
+        if singleton:
             methods = self._verbs(
                 set(getattr(registered_resource, "methods", None) or ()),
                 ("GET", "POST", "PUT", "PATCH", "DELETE"),

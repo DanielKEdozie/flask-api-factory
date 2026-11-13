@@ -85,6 +85,12 @@ class ProfileResource(ApiResource):
 class ClassProfileResource(ProfileResource):
     parent_resource = WidgetResource
     parent_fk = "widget_id"
+    singleton = True
+
+
+class LegacyClassProfileResource(ProfileResource):
+    parent_resource = WidgetResource
+    parent_fk = "widget_id"
     one_to_one = True
 
 
@@ -188,6 +194,34 @@ class FrameworkTestCase(unittest.TestCase):
         self.assertEqual(child.status_code, 201)
         child_data = child.get_json()["data"]
         self.assertEqual(child_data["parent_id"], root_id)
+
+        wrong_parent_child_url = (
+            f"/api/widgets/{other_root_id}/children/{child_data['id']}"
+        )
+        self.assertEqual(
+            self.client.patch(wrong_parent_child_url, json={"name": "hijacked"})
+            .status_code,
+            404,
+        )
+        self.assertEqual(
+            self.client.put(
+                wrong_parent_child_url,
+                json={"name": "hijacked"},
+            ).status_code,
+            404,
+        )
+        self.assertEqual(self.client.delete(wrong_parent_child_url).status_code, 404)
+        updated_child = self.client.put(
+            f"/api/widgets/{root_id}/children/{child_data['id']}",
+            json={"name": "child", "parent_id": other_root_id},
+        )
+        self.assertEqual(updated_child.status_code, 200)
+        self.assertEqual(updated_child.get_json()["data"]["parent_id"], root_id)
+        self.assertEqual(
+            self.client.get(f"/api/widgets/{root_id}/children/{child_data['id']}")
+            .get_json()["data"]["name"],
+            "child",
+        )
         self.assertEqual(
             self.client.get(f"/api/widgets/{other_root_id}/children")
             .get_json()["data"],
@@ -206,23 +240,36 @@ class FrameworkTestCase(unittest.TestCase):
         self.assertEqual(created_grandchild.status_code, 201)
         self.assertEqual(created_grandchild.get_json()["data"]["parent_id"], child_data["id"])
 
-    def test_factory_and_class_level_one_to_one_registration(self):
+    def test_factory_and_class_level_singleton_registration(self):
         profile_api = self.api.nested_resource(
             ProfileResource,
             parent=self.widgets,
             path="profile",
             defaults={"widget_id": "id"},
+            singleton=True,
+        )
+        legacy_profile_api = self.widgets.nested_resource(
+            ProfileResource,
+            path="legacy-profile",
+            fk="widget_id",
             one_to_one=True,
         )
         profile_api.nested_resource(
             ProfileNoteResource, path="notes", fk="profile_id"
         )
         self.api.register_resource(ClassProfileResource, path="class-profile")
+        legacy_class_profile_api = self.api.register_resource(
+            LegacyClassProfileResource, path="legacy-class-profile"
+        )
+        self.assertTrue(legacy_profile_api.singleton)
+        self.assertTrue(legacy_profile_api.one_to_one)
+        self.assertTrue(legacy_class_profile_api.singleton)
 
         widget = self.client.post(
             "/api/widgets", json={"name": "profile-owner"}
         ).get_json()["data"]
         profile_url = f"/api/widgets/{widget['id']}/profile"
+        legacy_profile_url = f"/api/widgets/{widget['id']}/legacy-profile"
 
         self.assertEqual(self.client.get(profile_url).status_code, 404)
         created = self.client.post(
@@ -233,6 +280,10 @@ class FrameworkTestCase(unittest.TestCase):
         profile = created.get_json()["data"]
         self.assertEqual(profile["widget_id"], widget["id"])
         self.assertEqual(self.client.get(profile_url).get_json()["data"]["bio"], "A profile")
+        self.assertEqual(
+            self.client.get(legacy_profile_url).get_json()["data"]["bio"],
+            "A profile",
+        )
         spec = self.client.get("/api/openapi.json").get_json()
         self.assertEqual(
             set(spec["paths"]["/api/widgets/{widget_id}/profile"]),
