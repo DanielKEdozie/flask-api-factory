@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flask-api-factory"
+version = "0.1.0"
+description = "Declarative, Flask-native CRUD resources built on Flask-SQLAlchemy and Marshmallow."
+requires-python = ">=3.9"
+dependencies = [
+    "Flask",
+    "Flask-SQLAlchemy",
+    "marshmallow",
+]
+
+[tool.setuptools]
+packages = ["flask_api_factory"]
