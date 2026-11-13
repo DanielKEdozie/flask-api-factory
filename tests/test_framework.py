@@ -14,7 +14,13 @@ from flask.views import MethodView
 from flask_sqlalchemy import SQLAlchemy
 from marshmallow import Schema, fields
 
-from flask_api_factory import ApiFactory, ApiResource, ApiError, abort
+from flask_api_factory import (
+    ApiError,
+    ApiFactory,
+    ApiResource,
+    ResourceRegistration,
+    abort,
+)
 from flask_api_factory import factory, pagination, params, querying, resource, routing, service
 
 
@@ -33,6 +39,22 @@ class Widget(db.Model):
     parent = db.relationship("Widget", remote_side=[id], backref="children")
 
 
+class Profile(db.Model):
+    __tablename__ = "profiles"
+
+    id = db.Column(db.Integer, primary_key=True)
+    widget_id = db.Column(db.Integer, db.ForeignKey("widgets.id"), unique=True, nullable=False)
+    bio = db.Column(db.String(100), nullable=False)
+
+
+class ProfileNote(db.Model):
+    __tablename__ = "profile_notes"
+
+    id = db.Column(db.Integer, primary_key=True)
+    profile_id = db.Column(db.Integer, db.ForeignKey("profiles.id"), nullable=False)
+    text = db.Column(db.String(100), nullable=False)
+
+
 class WidgetSchema(Schema):
     id = fields.Int(dump_only=True)
     name = fields.Str(required=True)
@@ -47,6 +69,34 @@ class WidgetResource(ApiResource):
     filter_fields = ["kind", "count"]
     sort_fields = ["name"]
     paginate = False
+
+
+class ProfileSchema(Schema):
+    id = fields.Int(dump_only=True)
+    widget_id = fields.Int()
+    bio = fields.Str(required=True)
+
+
+class ProfileResource(ApiResource):
+    schema = ProfileSchema
+    model = Profile
+
+
+class ClassProfileResource(ProfileResource):
+    parent_resource = WidgetResource
+    parent_fk = "widget_id"
+    one_to_one = True
+
+
+class ProfileNoteSchema(Schema):
+    id = fields.Int(dump_only=True)
+    profile_id = fields.Int()
+    text = fields.Str(required=True)
+
+
+class ProfileNoteResource(ApiResource):
+    schema = ProfileNoteSchema
+    model = ProfileNote
 
 
 class ReadOnlyWidgetResource(WidgetResource):
@@ -85,7 +135,7 @@ class FrameworkTestCase(unittest.TestCase):
                 "servers": ["https://api.example.test"],
             },
         )
-        self.api.register_resource(WidgetResource, path="/widgets")
+        self.widgets = self.api.register_resource(WidgetResource, path="/widgets")
 
         with self.app.app_context():
             db.create_all()
@@ -106,6 +156,124 @@ class FrameworkTestCase(unittest.TestCase):
         got = self.client.get(f"/api/widgets/{payload['data']['id']}")
         self.assertEqual(got.status_code, 200)
         self.assertEqual(got.get_json()["data"]["name"], "hammer")
+
+    def test_registration_handle_supports_nested_and_chained_resources(self):
+        children = self.widgets.nested_resource(
+            WidgetResource,
+            path="children",
+            fk="parent_id",
+            param_name="widget_id",
+        )
+        self.assertIsInstance(children, ResourceRegistration)
+        self.assertIs(children.resource.__bases__[0], WidgetResource)
+        grandchildren = children.nested_resource(
+            WidgetResource,
+            path="grandchildren",
+            fk="parent_id",
+            param_name="child_id",
+        )
+        self.assertTrue(grandchildren.path.endswith("/grandchildren"))
+
+        root_id = self.client.post(
+            "/api/widgets", json={"name": "root"}
+        ).get_json()["data"]["id"]
+        other_root_id = self.client.post(
+            "/api/widgets", json={"name": "other-root"}
+        ).get_json()["data"]["id"]
+
+        child = self.client.post(
+            f"/api/widgets/{root_id}/children",
+            json={"name": "child", "parent_id": other_root_id},
+        )
+        self.assertEqual(child.status_code, 201)
+        child_data = child.get_json()["data"]
+        self.assertEqual(child_data["parent_id"], root_id)
+        self.assertEqual(
+            self.client.get(f"/api/widgets/{other_root_id}/children")
+            .get_json()["data"],
+            [],
+        )
+
+        wrong_parent = self.client.get(
+            f"/api/widgets/{other_root_id}/children/{child_data['id']}/grandchildren"
+        )
+        self.assertEqual(wrong_parent.status_code, 404)
+
+        created_grandchild = self.client.post(
+            f"/api/widgets/{root_id}/children/{child_data['id']}/grandchildren",
+            json={"name": "grandchild"},
+        )
+        self.assertEqual(created_grandchild.status_code, 201)
+        self.assertEqual(created_grandchild.get_json()["data"]["parent_id"], child_data["id"])
+
+    def test_factory_and_class_level_one_to_one_registration(self):
+        profile_api = self.api.nested_resource(
+            ProfileResource,
+            parent=self.widgets,
+            path="profile",
+            defaults={"widget_id": "id"},
+            one_to_one=True,
+        )
+        profile_api.nested_resource(
+            ProfileNoteResource, path="notes", fk="profile_id"
+        )
+        self.api.register_resource(ClassProfileResource, path="class-profile")
+
+        widget = self.client.post(
+            "/api/widgets", json={"name": "profile-owner"}
+        ).get_json()["data"]
+        profile_url = f"/api/widgets/{widget['id']}/profile"
+
+        self.assertEqual(self.client.get(profile_url).status_code, 404)
+        created = self.client.post(
+            profile_url,
+            json={"bio": "A profile", "widget_id": widget["id"] + 100},
+        )
+        self.assertEqual(created.status_code, 201)
+        profile = created.get_json()["data"]
+        self.assertEqual(profile["widget_id"], widget["id"])
+        self.assertEqual(self.client.get(profile_url).get_json()["data"]["bio"], "A profile")
+        spec = self.client.get("/api/openapi.json").get_json()
+        self.assertEqual(
+            set(spec["paths"]["/api/widgets/{widget_id}/profile"]),
+            {"get", "post", "put", "patch", "delete"},
+        )
+        self.assertEqual(
+            spec["paths"]["/api/widgets/{widget_id}/profile"]["get"]
+            ["responses"]["200"]["content"]["application/json"]["schema"]
+            ["properties"]["data"]["$ref"],
+            "#/components/schemas/ProfileSchema",
+        )
+        self.assertNotIn(
+            "/api/widgets/{widget_id}/profile/{id}", spec["paths"]
+        )
+
+        updated = self.client.patch(profile_url, json={"bio": "Updated"})
+        self.assertEqual(updated.status_code, 200)
+        self.assertEqual(updated.get_json()["data"]["bio"], "Updated")
+        replaced = self.client.put(profile_url, json={"bio": "Replaced"})
+        self.assertEqual(replaced.status_code, 200)
+        self.assertEqual(replaced.get_json()["data"]["bio"], "Replaced")
+
+        note_url = f"{profile_url}/notes"
+        note = self.client.post(
+            note_url,
+            json={"text": "Nested note", "profile_id": profile["id"] + 100},
+        )
+        self.assertEqual(note.status_code, 201)
+        self.assertEqual(note.get_json()["data"]["profile_id"], profile["id"])
+        self.assertEqual(
+            self.client.get(note_url).get_json()["data"]["items"][0]["text"],
+            "Nested note",
+        )
+
+        class_profile_url = f"/api/widgets/{widget['id']}/class-profile"
+        self.assertEqual(
+            self.client.get(class_profile_url).get_json()["data"]["bio"],
+            "Replaced",
+        )
+        self.assertEqual(self.client.delete(profile_url).status_code, 204)
+        self.assertEqual(self.client.get(class_profile_url).status_code, 404)
 
     def test_list_and_filter(self):
         self.client.post("/api/widgets", json={"name": "a", "kind": "tool"})

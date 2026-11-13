@@ -96,7 +96,28 @@ class ParamMixin:
         ``_build_query`` scopes results to the parent automatically.
         """
         filters = {}
+        contexts = getattr(self, "_nested_parent_contexts", ())
+        if contexts:
+            context = contexts[-1]
+            parent = self._nested_parent_object(context)
+            if parent is None:
+                raise ApiError(404, "Parent resource not found")
+            defaults = dict(context["defaults"])
+            defaults.setdefault(context["fk"], context["pk_field"])
+            for field, source in defaults.items():
+                if callable(source):
+                    value = source(parent)
+                elif isinstance(source, str) and hasattr(parent, source):
+                    value = getattr(parent, source)
+                else:
+                    value = source
+                if getattr(self.model, field, None) is not None:
+                    filters[field] = value
+
+        context_params = {context["param"] for context in contexts}
         for name, obj in self._resolved.items():
+            if name in context_params:
+                continue
             col = getattr(self.model, name, None)
             if col is not None:
                 # obj may be the resolved model instance or the raw coerced value

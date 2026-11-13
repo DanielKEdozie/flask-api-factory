@@ -61,12 +61,9 @@ class ApiService:
             self.db.session.rollback()
             raise ApiError(500, "Database error", errors={"detail": str(e)}) from e
 
-    def _get_obj(self, pk, pk_field='id'):
-        obj = (
-            self.db.session.query(self.model)
-            .filter(getattr(self.model, pk_field) == pk)
-            .first()
-        )
+    def _get_obj(self, pk, pk_field='id', query=None):
+        query = query if query is not None else self.db.session.query(self.model)
+        obj = query.filter(getattr(self.model, pk_field) == pk).first()
         if not obj:
             raise ApiError(404, f"{self.model.__name__} not found")
         return obj
@@ -128,8 +125,8 @@ class ApiService:
         self.commit()
         return self.response(self.dump(obj), 201)
 
-    def update(self, pk, data, pk_field='id', partial=False):
-        obj = self._get_obj(pk, pk_field)
+    def update(self, pk, data, pk_field='id', partial=False, query=None):
+        obj = self._get_obj(pk, pk_field, query=query)
         self._execute_hook("before_load", data, instance=obj, mode="update")
         loaded_data = self.load(data, partial=partial)
         self._execute_hook("after_load", obj, loaded_data, mode="update")
@@ -139,8 +136,8 @@ class ApiService:
         self.commit()
         return self.response(self.dump(obj))
 
-    def delete(self, pk, pk_field='id'):
-        obj = self._get_obj(pk, pk_field)
+    def delete(self, pk, pk_field='id', query=None):
+        obj = self._get_obj(pk, pk_field, query=query)
         self.db.session.delete(obj)
         self.commit()
         return self.response(None, 204)

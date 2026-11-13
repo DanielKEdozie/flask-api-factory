@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, Iterable, List, Optional
 
-from flask import Response, jsonify
+from flask import Response, jsonify, request
 from werkzeug.exceptions import HTTPException
 
 from flask_api_factory.docs_ui import redoc_page, swagger_page
@@ -10,6 +10,57 @@ from flask_api_factory.errors import ApiError
 from flask_api_factory.openapi import OpenAPISpec
 from flask_api_factory.resource import ApiResource
 from flask_api_factory.routing import normalize_prefix
+
+
+class ResourceRegistration:
+    """A registered resource and the factory context used to nest children."""
+
+    def __init__(
+        self,
+        factory: "ApiFactory",
+        resource: type,
+        path: str,
+        endpoint: str,
+        pk_field: str,
+        pk_type: str,
+        one_to_one: bool = False,
+    ):
+        self.factory = factory
+        self.resource = resource
+        self.path = path
+        self.endpoint = endpoint
+        self.pk_field = pk_field
+        self.pk_type = pk_type
+        self.one_to_one = one_to_one
+
+    def nested_resource(
+        self,
+        resource: type,
+        *,
+        path: str,
+        fk: Optional[str] = None,
+        defaults: Optional[Dict[str, Any]] = None,
+        param_name: Optional[str] = None,
+        endpoint: Optional[str] = None,
+        one_to_one: bool = False,
+        **rule_options,
+    ) -> "ResourceRegistration":
+        """Register a child resource beneath this resource's detail route."""
+        return self.factory._register_nested_resource(
+            parent=self,
+            resource=resource,
+            path=path,
+            fk=fk,
+            defaults=defaults,
+            param_name=param_name,
+            endpoint=endpoint,
+            one_to_one=one_to_one,
+            **rule_options,
+        )
+
+    def __getattr__(self, name):
+        """Delegate resource attributes for callers migrating from class returns."""
+        return getattr(self.resource, name)
 
 
 class ApiFactory:
@@ -23,7 +74,10 @@ class ApiFactory:
     Usage::
 
         api = ApiFactory(app, db=db, url_prefix="/api")
-        api.register_resource(UserResource, path="/users")
+        users = api.register_resource(UserResource, path="/users")
+        users.nested_resource(
+            ProfileResource, path="profile", fk="user_id", one_to_one=True
+        )
         api.register_resource(LoginResource, urls=["/auth/login"])  # explicit URLs
     """
 
@@ -49,6 +103,7 @@ class ApiFactory:
         self._url_prefix = ("/" + (url_prefix or "").strip("/")).rstrip("/") if url_prefix else ""
         self._docs = docs
         self._resources: List[type] = []
+        self._registrations: List[ResourceRegistration] = []
         self._openapi_spec = OpenAPISpec(docs=docs)
         self._openapi_url = openapi_url
         self._docs_url = docs_url
@@ -175,8 +230,26 @@ class ApiFactory:
         are neither collection nor detail, so they keep every verb the resource
         defines unless you pass ``methods=`` yourself.
 
-        Returns the resource class.
+        Returns a :class:`ResourceRegistration`; use ``registration.resource``
+        to access the registered resource class. The handle can register
+        nested resources with :meth:`ResourceRegistration.nested_resource`.
         """
+        declared_parent = getattr(resource, "parent_resource", None)
+        if declared_parent is not None and urls is None and params is None:
+            parent = self._find_registration(declared_parent)
+            return self._register_nested_resource(
+                parent=parent,
+                resource=resource,
+                path=path,
+                fk=getattr(resource, "parent_fk", None),
+                defaults=getattr(resource, "parent_defaults", None),
+                param_name=getattr(resource, "parent_param", None),
+                endpoint=endpoint,
+                one_to_one=getattr(resource, "one_to_one", False),
+                detail=detail,
+                **rule_options,
+            )
+
         is_api_resource = isinstance(resource, type) and issubclass(resource, ApiResource)
 
         if is_api_resource and self._db is not None:
@@ -188,6 +261,7 @@ class ApiFactory:
 
         if urls is None:
             base = self._base_path(resource, path, params)
+            registration_path = base
             want_detail = is_api_resource if detail is None else detail
             if want_detail:
                 pk_field = getattr(resource, "pk_field", "id")
@@ -203,6 +277,7 @@ class ApiFactory:
                 rules = [(base, None)]
         else:
             rules = [(rule, None) for rule in urls]
+            registration_path = rules[0][0] if rules else ""
 
         blueprint_prefix = getattr(self._target, "url_prefix", None) or ""
         for index, (rule, verbs) in enumerate(rules):
@@ -221,14 +296,296 @@ class ApiFactory:
                 detail=(
                     is_api_resource
                     and (
-                        f":{getattr(resource, 'pk_field', 'id')}>" in rule
+                        getattr(resource, "_nested_one_to_one", False)
+                        or f":{getattr(resource, 'pk_field', 'id')}>" in rule
                         or f"<{getattr(resource, 'pk_field', 'id')}>" in rule
                     )
                 ),
             )
 
         self._resources.append(resource)
-        return resource
+        registration = ResourceRegistration(
+            self,
+            resource,
+            registration_path,
+            ep,
+            getattr(resource, "pk_field", "id"),
+            getattr(resource, "pk_type", "int"),
+            bool(getattr(resource, "_nested_one_to_one", False)),
+        )
+        self._registrations.append(registration)
+        return registration
+
+    def _find_registration(self, resource_or_registration):
+        if isinstance(resource_or_registration, ResourceRegistration):
+            return resource_or_registration
+        if not isinstance(resource_or_registration, type):
+            raise ValueError("parent must be a registered resource class or registration handle")
+        matches = [
+            registration for registration in self._registrations
+            if registration.resource is resource_or_registration
+        ]
+        if not matches:
+            matches = [
+                registration for registration in self._registrations
+                if issubclass(registration.resource, resource_or_registration)
+            ]
+        if not matches:
+            raise ValueError(
+                f"Parent resource {getattr(resource_or_registration, '__name__', resource_or_registration)!r} "
+                "must be registered before its nested resource"
+            )
+        return matches[-1]
+
+    def nested_resource(
+        self,
+        resource: type,
+        *,
+        parent,
+        path: str,
+        fk: Optional[str] = None,
+        defaults: Optional[Dict[str, Any]] = None,
+        param_name: Optional[str] = None,
+        endpoint: Optional[str] = None,
+        one_to_one: bool = False,
+        **rule_options,
+    ) -> ResourceRegistration:
+        """Register a nested resource with an explicitly selected parent.
+
+        ``fk`` names the child's parent foreign-key field. ``defaults`` may
+        map child fields to attributes on the parent (for example
+        ``{"user_id": "id"}``). A one-to-one resource uses a singular URL
+        without a child primary-key segment.
+        """
+        return self._register_nested_resource(
+            parent=self._find_registration(parent),
+            resource=resource,
+            path=path,
+            fk=fk,
+            defaults=defaults,
+            param_name=param_name,
+            endpoint=endpoint,
+            one_to_one=one_to_one,
+            **rule_options,
+        )
+
+    def _register_nested_resource(
+        self,
+        *,
+        parent: ResourceRegistration,
+        resource: type,
+        path: Optional[str],
+        fk: Optional[str],
+        defaults: Optional[Dict[str, Any]],
+        param_name: Optional[str],
+        endpoint: Optional[str],
+        one_to_one: bool,
+        detail: Optional[bool] = None,
+        **rule_options,
+    ) -> ResourceRegistration:
+        if not path:
+            raise ValueError(f"{resource.__name__}: 'path' is required for a nested resource")
+        if not isinstance(resource, type) or not issubclass(resource, ApiResource):
+            raise TypeError("Nested resources must subclass ApiResource")
+
+        defaults = dict(defaults or {})
+        if fk is None and len(defaults) == 1:
+            fk = next(iter(defaults))
+        if fk is None:
+            raise ValueError(
+                "Provide fk='parent_id', or a single-field defaults mapping; "
+                "specify fk when defaults contains multiple fields"
+            )
+
+        param = param_name or fk
+        parent_model = getattr(parent.resource, "model", None)
+        if parent_model is None:
+            raise ValueError(f"{parent.resource.__name__} has no model for parent lookup")
+        parent_pk_field = parent.pk_field
+        if getattr(parent_model, parent_pk_field, None) is None:
+            raise ValueError(
+                f"{parent.resource.__name__} has no primary-key field {parent_pk_field!r}"
+            )
+        child_model = getattr(resource, "model", None)
+        if child_model is None:
+            raise ValueError(f"{resource.__name__} has no model for foreign-key scoping")
+        for field in {fk, *defaults.keys()}:
+            if getattr(child_model, field, None) is None:
+                raise ValueError(
+                    f"{resource.__name__} has no model field {field!r} for nested scoping"
+                )
+        for source in defaults.values():
+            if isinstance(source, str) and getattr(parent_model, source, None) is None:
+                raise ValueError(
+                    f"{parent.resource.__name__} has no parent attribute {source!r}"
+                )
+        if not parent.one_to_one and param in (
+            getattr(parent.resource, "route_params", {}) or {}
+        ):
+            raise ValueError(
+                f"Nested route parameter {param!r} conflicts with an ancestor parameter"
+            )
+        if not parent.one_to_one and param == getattr(resource, "pk_field", "id"):
+            raise ValueError(
+                f"Nested route parameter {param!r} conflicts with the child primary key"
+            )
+        if one_to_one and detail:
+            raise ValueError("one_to_one resources cannot register a child detail route")
+        db = self._db
+        if db is None:
+            raise RuntimeError("A db instance is required to register nested ApiResource resources")
+
+        ancestor_contexts = tuple(
+            getattr(parent.resource, "_nested_parent_contexts", ()) or ()
+        )
+
+        def context_parent(context):
+            context_param = context["param"]
+            if context_param is not None:
+                raw = (request.view_args or {}).get(context_param)
+                if raw is None:
+                    return None
+                rules = getattr(parent.resource, "route_params", {}) or {}
+                coerce = rules.get(context_param, {}).get("type", str)
+                try:
+                    value = coerce(raw)
+                except (TypeError, ValueError):
+                    raise ApiError(
+                        400, f"Invalid value for URL parameter '{context_param}'"
+                    ) from None
+                resolver = (getattr(parent.resource, "resolve_params", {}) or {}).get(
+                    context_param
+                )
+                if resolver is None:
+                    return value
+                result = resolver(value)
+                if isinstance(result, tuple):
+                    payload, status = result
+                    message = (
+                        payload.get("message", "Error")
+                        if isinstance(payload, dict)
+                        else str(payload)
+                    )
+                    errors = payload.get("errors") if isinstance(payload, dict) else None
+                    raise ApiError(status, message, errors=errors)
+                return result
+
+            model = context["parent_model"]
+            query = db.session.query(model)
+            for ancestor in context["ancestors"]:
+                ancestor_obj = context_parent(ancestor)
+                if ancestor_obj is None:
+                    return None
+                defaults_for_ancestor = dict(ancestor["defaults"])
+                defaults_for_ancestor.setdefault(
+                    ancestor["fk"], ancestor["pk_field"]
+                )
+                source = defaults_for_ancestor[ancestor["fk"]]
+                if callable(source):
+                    value = source(ancestor_obj)
+                elif isinstance(source, str) and hasattr(ancestor_obj, source):
+                    value = getattr(ancestor_obj, source)
+                else:
+                    value = source
+                column = getattr(model, ancestor["fk"], None)
+                if column is not None:
+                    query = query.filter(column == value)
+            return query.first()
+
+        def resolve_parent(value):
+            parent_pk_column = getattr(parent_model, parent_pk_field, None)
+            if parent_pk_column is None:
+                raise ValueError(
+                    f"{parent.resource.__name__} has no primary-key field {parent_pk_field!r}"
+                )
+            query = db.session.query(parent_model).filter(parent_pk_column == value)
+            for context in ancestor_contexts:
+                ancestor_obj = context_parent(context)
+                if ancestor_obj is None:
+                    return None
+                defaults_for_context = dict(context["defaults"])
+                defaults_for_context.setdefault(context["fk"], context["pk_field"])
+                source = defaults_for_context[context["fk"]]
+                if callable(source):
+                    parent_value = source(ancestor_obj)
+                elif isinstance(source, str) and hasattr(ancestor_obj, source):
+                    parent_value = getattr(ancestor_obj, source)
+                else:
+                    parent_value = source
+                column = getattr(parent_model, context["fk"], None)
+                if column is not None:
+                    query = query.filter(column == parent_value)
+            return query.first()
+
+        param = None if parent.one_to_one else param
+        route_params = {
+            **dict(getattr(parent.resource, "route_params", {}) or {}),
+            **dict(getattr(resource, "route_params", {}) or {}),
+        }
+        resolve_params = {
+            **dict(getattr(parent.resource, "resolve_params", {}) or {}),
+            **dict(getattr(resource, "resolve_params", {}) or {}),
+        }
+        if param is not None:
+            pk_column = getattr(parent_model, parent_pk_field)
+            try:
+                pk_python_type = pk_column.type.python_type
+            except (AttributeError, NotImplementedError):
+                pk_python_type = int if parent.pk_type == "int" else str
+            route_params[param] = {
+                "type": pk_python_type,
+                "required": True,
+            }
+            resolve_params[param] = resolve_parent
+
+        nested_contexts = list(ancestor_contexts)
+        nested_contexts.append({
+            "param": param,
+            "fk": fk,
+            "defaults": defaults,
+            "pk_field": parent_pk_field,
+            "parent_model": parent_model,
+            "ancestors": tuple(
+                getattr(parent.resource, "_nested_parent_contexts", ()) or ()
+            ),
+        })
+        attrs = {
+            "parent_resource": None,
+            "route_params": route_params,
+            "resolve_params": resolve_params,
+            "_nested_parent_contexts": tuple(nested_contexts),
+            "_nested_one_to_one": one_to_one,
+        }
+        registered_resource = type(
+            f"{resource.__name__}Nested{len(self._registrations) + 1}",
+            (resource,),
+            attrs,
+        )
+
+        parent_detail_path = (
+            parent.path
+            if parent.one_to_one
+            else f"{parent.path}/<{parent.pk_type}:{param}>"
+        )
+        nested_path = f"{parent_detail_path}/{path.strip('/')}"
+        allowed_detail = detail if detail is not None else not one_to_one
+        methods = None
+        if one_to_one:
+            methods = self._verbs(
+                set(getattr(registered_resource, "methods", None) or ()),
+                ("GET", "POST", "PUT", "PATCH", "DELETE"),
+            )
+        register_options = dict(rule_options)
+        if methods is not None:
+            register_options["methods"] = methods
+        registration = self.register_resource(
+            registered_resource,
+            path=nested_path.removeprefix(self._url_prefix) if self._url_prefix else nested_path,
+            endpoint=endpoint or f"{parent.endpoint}_{path.strip('/').replace('/', '_')}",
+            detail=allowed_detail,
+            **register_options,
+        )
+        return registration
 
     # ---- internals -----------------------------------------------------
 

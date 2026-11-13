@@ -37,7 +37,7 @@ class WidgetResource(ApiResource):
 
 
 api = ApiFactory(app, db=db, url_prefix="/api")
-api.register_resource(WidgetResource, path="/widgets")
+widgets = api.register_resource(WidgetResource, path="/widgets")
 ```
 
 This exposes:
@@ -49,6 +49,34 @@ This exposes:
 | `GET` | `/api/widgets/<id>` | retrieve |
 | `PUT`/`PATCH` | `/api/widgets/<id>` | update |
 | `DELETE` | `/api/widgets/<id>` | delete |
+
+`register_resource()` returns a registration handle. Use it to attach a child
+resource; the child foreign key is injected from the parent and used to scope
+list, retrieve, update, and delete operations:
+
+```python
+class ProfileResource(ApiResource):
+    schema = ProfileSchema
+    model = Profile
+
+profiles = widgets.nested_resource(
+    ProfileResource,
+    path="profiles",
+    fk="widget_id",
+)
+```
+
+By default this creates collection and detail routes under
+`/api/widgets/<widget_id>/profiles`. Use `one_to_one=True` for a singular
+child endpoint such as `/api/widgets/<widget_id>/profile`; it supports
+`GET`, `POST`, `PUT`, `PATCH`, and `DELETE` without a child ID segment.
+
+The same registration can be done with `api.nested_resource(...,
+parent=widgets, ...)`. For class-level declarations, set
+`parent_resource`, `parent_fk`, and optionally `one_to_one` on the child
+resource, then register it after its parent. In all forms, `fk` names a child
+model field; `defaults` can map child fields to parent attributes:
+`defaults={"widget_id": "id"}`.
 
 ## OpenAPI
 
@@ -80,7 +108,8 @@ to disable the endpoint, or `openapi_url="/docs/openapi.json"` to move it.
 - **Sorting** — `sort_fields`, `default_sort_field`, `default_sort_order`.
 - **Eager loading** — `eager_loads` relationship names.
 - **Pagination** — `paginate`, `page_size`, `max_page_size`, `?paginate=`.
-- **Nesting** — `params=[("/fleets", "<int:fleet_id>")]` at registration time.
+- **Nesting** — use the parent registration handle's `nested_resource()`;
+  legacy `params=[(...)]` routes remain supported.
 - **Hooks** — `before_load`, `after_load`, `before_commit`.
 
 ## Tests
