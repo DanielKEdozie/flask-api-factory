@@ -14,7 +14,7 @@ from flask.views import MethodView
 from flask_sqlalchemy import SQLAlchemy
 from marshmallow import Schema, fields
 
-from flask_api_factory import ApiFactory, ApiResource
+from flask_api_factory import ApiFactory, ApiResource, ApiError, abort
 from flask_api_factory import factory, pagination, params, querying, resource, routing, service
 
 
@@ -27,19 +27,43 @@ class Widget(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     name = db.Column(db.String(50), nullable=False)
     kind = db.Column(db.String(20), default="generic")
+    count = db.Column(db.Integer, default=0)
+    parent_id = db.Column(db.Integer, db.ForeignKey("widgets.id"), nullable=True)
+
+    parent = db.relationship("Widget", remote_side=[id], backref="children")
 
 
 class WidgetSchema(Schema):
     id = fields.Int(dump_only=True)
     name = fields.Str(required=True)
     kind = fields.Str()
+    count = fields.Int()
+    parent_id = fields.Int()
 
 
 class WidgetResource(ApiResource):
     schema = WidgetSchema
     model = Widget
-    filter_fields = ["kind"]
+    filter_fields = ["kind", "count"]
+    sort_fields = ["name"]
     paginate = False
+
+
+class ReadOnlyWidgetResource(WidgetResource):
+    allow_create = False
+    allow_update = False
+    allow_delete = False
+
+
+class TypedFilterWidgetResource(WidgetResource):
+    # Transform the raw query-string value to prove filter_types is applied
+    # instead of the column's Python type.
+    filter_types = {"count": lambda raw: int(raw) + 100}
+
+
+class EagerLoadWidgetResource(WidgetResource):
+    from sqlalchemy.orm import joinedload as _joinedload
+    eager_loads = [_joinedload(Widget.parent)]
 
 
 class FrameworkTestCase(unittest.TestCase):
@@ -175,6 +199,226 @@ class FrameworkTestCase(unittest.TestCase):
         client = app.test_client()
         self.assertEqual(client.get("/v1/openapi.json").status_code, 200)
         self.assertIn("/v1/health", client.get("/v1/openapi.json").get_json()["paths"])
+
+    def test_patch_allows_partial_update(self):
+        wid = self.client.post("/api/widgets", json={"name": "a", "kind": "tool"}).get_json()["data"]["id"]
+
+        resp = self.client.patch(f"/api/widgets/{wid}", json={"kind": "toy"})
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.get_json()["data"]["kind"], "toy")
+        self.assertEqual(resp.get_json()["data"]["name"], "a")
+
+    def test_put_requires_full_payload(self):
+        wid = self.client.post("/api/widgets", json={"name": "a", "kind": "tool"}).get_json()["data"]["id"]
+
+        resp = self.client.put(f"/api/widgets/{wid}", json={"kind": "toy"})
+
+        self.assertEqual(resp.status_code, 422)
+
+    def test_allow_flags_are_enforced(self):
+        app = Flask(__name__)
+        app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite://"
+        app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+        db.init_app(app)
+        api = ApiFactory(app, db=db, url_prefix="/api")
+        api.register_resource(ReadOnlyWidgetResource, path="/readonly")
+        with app.app_context():
+            db.create_all()
+        client = app.test_client()
+
+        self.assertEqual(client.post("/api/readonly", json={"name": "a"}).status_code, 405)
+        self.assertEqual(client.put("/api/readonly/1", json={"name": "a"}).status_code, 405)
+        self.assertEqual(client.patch("/api/readonly/1", json={"name": "a"}).status_code, 405)
+        self.assertEqual(client.delete("/api/readonly/1").status_code, 405)
+
+    def test_invalid_filter_value_returns_400(self):
+        self.client.post("/api/widgets", json={"name": "a", "kind": "tool", "count": 3})
+
+        ok = self.client.get("/api/widgets?count=3")
+        self.assertEqual(ok.status_code, 200)
+        self.assertEqual([w["name"] for w in ok.get_json()["data"]], ["a"])
+
+        bad = self.client.get("/api/widgets?count=notanint")
+        self.assertEqual(bad.status_code, 400)
+        self.assertIn("message", bad.get_json())
+
+    def test_sort_rejects_unlisted_field(self):
+        self.client.post("/api/widgets", json={"name": "a", "kind": "tool"})
+
+        resp = self.client.get("/api/widgets?sort=kind")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual([w["name"] for w in resp.get_json()["data"]], ["a"])
+
+    def test_openapi_includes_security_schemes(self):
+        app = Flask(__name__)
+        app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite://"
+        app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+        db.init_app(app)
+        api = ApiFactory(
+            app,
+            db=db,
+            url_prefix="/api",
+            docs={
+                "title": "Secured API",
+                "version": "1.0.0",
+                "security_schemes": {
+                    "bearerAuth": {"type": "http", "scheme": "bearer", "bearerFormat": "JWT"}
+                },
+                "security": [{"bearerAuth": []}],
+            },
+        )
+        api.register_resource(WidgetResource, path="/widgets")
+        with app.app_context():
+            db.create_all()
+        client = app.test_client()
+
+        spec = client.get("/api/openapi.json").get_json()
+        self.assertEqual(
+            spec["components"]["securitySchemes"]["bearerAuth"]["scheme"],
+            "bearer",
+        )
+        self.assertEqual(spec["security"], [{"bearerAuth": []}])
+
+    def test_docs_method_configures_spec_and_ui(self):
+        app = Flask(__name__)
+        app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite://"
+        app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+        db.init_app(app)
+        api = ApiFactory(app, db=db, url_prefix="/api")
+        api.docs(
+            title="Chained API",
+            version="3.0.0",
+            description="Configured via docs().",
+            ui="redoc",
+            security_schemes={"bearerAuth": {"type": "http", "scheme": "bearer"}},
+            security=[{"bearerAuth": []}],
+        )
+        api.register_resource(WidgetResource, path="/widgets")
+        with app.app_context():
+            db.create_all()
+        client = app.test_client()
+
+        spec = client.get("/api/openapi.json").get_json()
+        self.assertEqual(spec["info"]["title"], "Chained API")
+        self.assertEqual(spec["info"]["version"], "3.0.0")
+        self.assertEqual(spec["components"]["securitySchemes"]["bearerAuth"]["scheme"], "bearer")
+
+        page = client.get("/api/docs")
+        self.assertEqual(page.status_code, 200)
+        self.assertIn("text/html", page.mimetype)
+        self.assertIn("redoc", page.get_data(as_text=True).lower())
+
+    def test_docs_method_rejects_invalid_ui(self):
+        app = Flask(__name__)
+        api = ApiFactory(app)
+        with self.assertRaises(ValueError):
+            api.docs(ui="not-a-ui")
+
+    def test_docs_page_defaults_to_swagger(self):
+        app = Flask(__name__)
+        app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite://"
+        app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+        db.init_app(app)
+        api = ApiFactory(app, db=db, url_prefix="/api")
+        api.register_resource(WidgetResource, path="/widgets")
+        with app.app_context():
+            db.create_all()
+        client = app.test_client()
+
+        page = client.get("/api/docs")
+        self.assertEqual(page.status_code, 200)
+        self.assertIn("swagger", page.get_data(as_text=True).lower())
+
+    def test_docs_url_can_be_disabled(self):
+        app = Flask(__name__)
+        api = ApiFactory(app, docs_url=None)
+        self.assertFalse(any(rule.rule == "/docs" for rule in app.url_map.iter_rules()))
+
+    def test_api_error_is_rendered_as_json(self):
+        app = Flask(__name__)
+        app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite://"
+        app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+        db.init_app(app)
+
+        class BoomResource(ApiResource):
+            schema = WidgetSchema
+            model = Widget
+
+            def get(self, **kwargs):
+                abort(403, "Nope", errors={"reason": "forbidden"}, code="forbidden")
+
+        api = ApiFactory(app, db=db, url_prefix="/api")
+        api.register_resource(BoomResource, path="/boom", detail=False)
+        with app.app_context():
+            db.create_all()
+        client = app.test_client()
+
+        resp = client.get("/api/boom")
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.get_json(), {
+            "message": "Nope",
+            "code": "forbidden",
+            "errors": {"reason": "forbidden"},
+        })
+
+    def test_api_error_defaults_message_from_status(self):
+        err = ApiError(404)
+        self.assertEqual(err.message, "Not found")
+        self.assertEqual(err.to_dict(), {"message": "Not found"})
+
+    def test_openapi_includes_error_component(self):
+        spec = self.client.get("/api/openapi.json").get_json()
+        self.assertIn("Error", spec["components"]["schemas"])
+        self.assertEqual(
+            spec["components"]["schemas"]["Error"]["required"],
+            ["message"],
+        )
+        self.assertIn("Error", spec["components"]["responses"])
+        self.assertEqual(
+            spec["paths"]["/api/widgets"]["get"]["responses"]["400"]["content"]
+            ["application/json"]["schema"]["$ref"],
+            "#/components/schemas/Error",
+        )
+
+    def test_filter_types_override_column_coercion(self):
+        app = Flask(__name__)
+        app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite://"
+        app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+        db.init_app(app)
+        api = ApiFactory(app, db=db, url_prefix="/api")
+        api.register_resource(TypedFilterWidgetResource, path="/typed")
+        with app.app_context():
+            db.create_all()
+        client = app.test_client()
+        client.post("/api/typed", json={"name": "a", "count": 3})
+
+        # filter_types transforms "3" -> 103, which matches no rows.
+        resp = client.get("/api/typed?count=3")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.get_json()["data"], [])
+
+        # And the untransformed value matches when the transform is identity.
+        resp = client.get("/api/typed?count=-97")  # -97 + 100 == 3
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual([w["name"] for w in resp.get_json()["data"]], ["a"])
+
+    def test_eager_loads_accepts_loader_options(self):
+        app = Flask(__name__)
+        app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite://"
+        app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+        db.init_app(app)
+        api = ApiFactory(app, db=db, url_prefix="/api")
+        api.register_resource(EagerLoadWidgetResource, path="/eager")
+        with app.app_context():
+            db.create_all()
+        client = app.test_client()
+        parent = client.post("/api/eager", json={"name": "parent"}).get_json()["data"]
+        client.post("/api/eager", json={"name": "child", "parent_id": parent["id"]})
+
+        resp = client.get("/api/eager")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(len(resp.get_json()["data"]), 2)
 
     def test_unbound_resource_raises(self):
         class UnboundResource(ApiResource):

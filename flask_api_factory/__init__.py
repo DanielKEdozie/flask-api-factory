@@ -21,6 +21,7 @@ from flask_api_factory.querying import QueryingMixin
 from flask_api_factory.pagination import PaginationMixin
 from flask_api_factory.resource import ApiResource
 from flask_api_factory.factory import ApiFactory
+from flask_api_factory.errors import ApiError, abort
 
 __version__ = "0.1.0"
 
@@ -28,6 +29,8 @@ __all__ = [
     "ApiService",
     "ApiResource",
     "ApiFactory",
+    "ApiError",
+    "abort",
     "RoutingMixin",
     "ParamMixin",
     "QueryingMixin",

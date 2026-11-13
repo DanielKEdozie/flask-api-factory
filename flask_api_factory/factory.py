@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from typing import Any, Dict, Iterable, List, Optional
 
-from flask import jsonify
+from flask import Response, jsonify
 from werkzeug.exceptions import HTTPException
 
+from flask_api_factory.docs_ui import redoc_page, swagger_page
+from flask_api_factory.errors import ApiError
 from flask_api_factory.openapi import OpenAPISpec
 from flask_api_factory.resource import ApiResource
 from flask_api_factory.routing import normalize_prefix
@@ -39,6 +41,8 @@ class ApiFactory:
         docs: Optional[Dict[str, Any]] = None,
         json_errors: bool = True,
         openapi_url: Optional[str] = "/openapi.json",
+        docs_url: Optional[str] = "/docs",
+        ui: str = "swagger",
     ):
         self._target = target
         self._db = db
@@ -46,16 +50,21 @@ class ApiFactory:
         self._docs = docs
         self._resources: List[type] = []
         self._openapi_spec = OpenAPISpec(docs=docs)
+        self._openapi_url = openapi_url
+        self._docs_url = docs_url
+        self._ui = ui
         if openapi_url is not None:
-            openapi_rule = (
-                f"{self._url_prefix}/{openapi_url.strip('/')}"
-                if self._url_prefix
-                else f"/{openapi_url.strip('/')}"
+            self._add_rule(
+                self._join_url(openapi_url),
+                f"openapi_{id(self)}",
+                self._serve_openapi,
+                methods=["GET"],
             )
-            target.add_url_rule(
-                openapi_rule,
-                endpoint=f"openapi_{id(self)}",
-                view_func=self._serve_openapi,
+        if docs_url is not None:
+            self._add_rule(
+                self._join_url(docs_url),
+                f"docs_{id(self)}",
+                self._serve_docs,
                 methods=["GET"],
             )
         if json_errors:
@@ -73,8 +82,64 @@ class ApiFactory:
         """The OpenAPI document generator for this factory."""
         return self._openapi_spec
 
+    def _join_url(self, url: str) -> str:
+        url = url.strip("/")
+        return f"{self._url_prefix}/{url}" if self._url_prefix else f"/{url}"
+
+    def _add_rule(self, rule, endpoint, view_func, **options):
+        self._target.add_url_rule(rule, endpoint=endpoint, view_func=view_func, **options)
+
     def _serve_openapi(self):
         return jsonify(self._openapi_spec.to_dict()), 200
+
+    def _serve_docs(self):
+        spec_url = self._join_url(self._openapi_url) if self._openapi_url else "/openapi.json"
+        title = self._openapi_spec.title
+        if self._ui == "redoc":
+            html = redoc_page(title, spec_url)
+        else:
+            html = swagger_page(title, spec_url)
+        return Response(html, mimetype="text/html")
+
+    def docs(self, *, title=None, version=None, summary=None, description=None,
+             contact=None, servers=None, tags=None, security_schemes=None,
+             security=None, ui=None):
+        """Configure the API docs in place and return ``self`` for chaining.
+
+        Example::
+
+            api = ApiFactory(app, db=db, url_prefix="/api")
+            api.docs(title="My API", version="1.0.0", ui="swagger")
+            api.register_resource(UserResource, path="/users")
+
+        ``ui`` is ``"swagger"`` (default) or ``"redoc"``. The HTML page and
+        JSON spec URLs are set via the constructor (``docs_url=`` /
+        ``openapi_url=``), since routes are registered at construction time.
+        """
+        spec = self._openapi_spec
+        if title is not None:
+            spec.title = title
+        if version is not None:
+            spec.version = version
+        if summary is not None:
+            spec.summary = summary
+        if description is not None:
+            spec.description = description
+        if contact is not None:
+            spec.contact = contact
+        if servers is not None:
+            spec.servers = servers
+        if tags is not None:
+            spec.tags = tags
+        if security_schemes is not None:
+            spec.security_schemes = security_schemes
+        if security is not None:
+            spec.security = security
+        if ui is not None:
+            if ui not in ("swagger", "redoc"):
+                raise ValueError(f"ui must be 'swagger' or 'redoc', got {ui!r}")
+            self._ui = ui
+        return self
 
     # ---- registration --------------------------------------------------
 
@@ -145,7 +210,7 @@ class ApiFactory:
             options = dict(rule_options)
             if verbs and "methods" not in options:
                 options["methods"] = verbs
-            self._add_rule(rule, rule_endpoint, resource, options)
+            self._add_resource_rule(rule, rule_endpoint, resource, options)
             route_methods = options.get("methods") or getattr(resource, "methods", None) or ()
             self._openapi_spec.add_resource(
                 resource,
@@ -183,13 +248,21 @@ class ApiFactory:
 
         return f"{self._url_prefix}{normalize_prefix(params)}/{path.strip('/')}"
 
-    def _add_rule(self, rule, endpoint, resource, options):
+    def _add_resource_rule(self, rule, endpoint, resource, options):
         self._target.add_url_rule(
             rule, endpoint=endpoint, view_func=resource.as_view(endpoint), **options
         )
 
     def _install_json_error_handler(self):
+        def api_error(exc: ApiError):
+            return exc.to_dict(), exc.status_code
+
         def handler(exc: HTTPException):
             return {"message": exc.description or exc.name}, exc.code
 
+        def unhandled(exc: Exception):
+            return {"message": "Internal server error"}, 500
+
+        self._target.register_error_handler(ApiError, api_error)
         self._target.register_error_handler(HTTPException, handler)
+        self._target.register_error_handler(Exception, unhandled)

@@ -37,6 +37,8 @@ class OpenAPISpec:
         servers: Optional[List[Any]] = None,
         tags: Optional[List[Dict[str, Any]]] = None,
         url_prefix: str = "",
+        security_schemes: Optional[Dict[str, Any]] = None,
+        security: Optional[List[Dict[str, List[str]]]] = None,
     ):
         self.docs = docs or {}
         self.title = self.docs.get("title", title)
@@ -47,8 +49,32 @@ class OpenAPISpec:
         self.servers = self.docs.get("servers", servers) or []
         self.tags = self.docs.get("tags", tags) or []
         self.url_prefix = self.docs.get("url_prefix", url_prefix)
+        self.security_schemes = self.docs.get("security_schemes", security_schemes) or {}
+        self.security = self.docs.get("security", security) or []
         self._paths: Dict[str, Any] = {}
-        self._components: Dict[str, Any] = {"schemas": {}}
+        self._components: Dict[str, Any] = {
+            "schemas": {
+                "Error": {
+                    "type": "object",
+                    "properties": {
+                        "message": {"type": "string"},
+                        "code": {"type": "string"},
+                        "errors": {"type": "object"},
+                    },
+                    "required": ["message"],
+                }
+            },
+            "responses": {
+                "Error": {
+                    "description": "Error response",
+                    "content": {
+                        "application/json": {
+                            "schema": {"$ref": "#/components/schemas/Error"},
+                        }
+                    },
+                }
+            },
+        }
         self._schema_names: Dict[Tuple[Type[Schema], bool], str] = {}
 
     def _normalize_contact(self) -> Optional[Dict[str, Any]]:
@@ -79,9 +105,14 @@ class OpenAPISpec:
             ]
         if self.tags:
             document["tags"] = self.tags
+        if self.security:
+            document["security"] = self.security
+        components = dict(self._components)
+        if self.security_schemes:
+            components["securitySchemes"] = self.security_schemes
         components = {
             key: value
-            for key, value in self._components.items()
+            for key, value in components.items()
             if value
         }
         if components:
@@ -304,6 +335,9 @@ class OpenAPISpec:
             operation["summary"] = summary
         if description:
             operation["description"] = description
+        resource_security = getattr(resource_class, "openapi_security", None)
+        if resource_security is not None:
+            operation["security"] = resource_security
 
         schema_class = self._schema_class(resource_class)
         parameters = list(path_parameters)
@@ -349,13 +383,7 @@ class OpenAPISpec:
                 "description": description,
                 "content": {
                     "application/json": {
-                        "schema": {
-                            "type": "object",
-                            "properties": {
-                                "message": {"type": "string"},
-                                "errors": {"type": "object"},
-                            },
-                        }
+                        "schema": {"$ref": "#/components/schemas/Error"},
                     }
                 },
             })

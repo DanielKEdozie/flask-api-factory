@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from flask_api_factory.errors import ApiError
+
 
 class ParamMixin:
     """URL-parameter validation/resolution for an ``ApiResource``.
@@ -18,11 +20,13 @@ class ParamMixin:
 
     resolve_params  Dict mapping param name → callable.  Each callable
                     receives the coerced param value and must return either
-                    the resolved object or a ``(payload, status)`` error
-                    tuple.  The resolved objects are stored in
-                    ``self._resolved`` and are also auto-injected as FK
-                    values into ``post`` payloads and as filters into
-                    ``_build_query``::
+                    the resolved object, ``None`` (→ 404), or raise
+                    :class:`ApiError`.  For backward compatibility a
+                    ``(payload, status)`` tuple is also accepted and is
+                    converted to an :class:`ApiError`.  The resolved objects
+                    are stored in ``self._resolved`` and are also
+                    auto-injected as FK values into ``post`` payloads and as
+                    filters into ``_build_query``::
 
                         resolve_params = {
                             "fleet_id": lambda fid: db.session.get(Fleet, fid)
@@ -41,9 +45,8 @@ class ParamMixin:
         ``resolve_params``.
 
         Coerces each param value using the ``type`` rule, then calls the
-        matching ``resolve_params`` callable (if any).  Returns ``None`` on
-        success; returns an error ``(payload, status)`` tuple on failure so
-        callers can short-circuit immediately.
+        matching ``resolve_params`` callable (if any).  Raises
+        :class:`ApiError` on failure.
 
         Resolved objects are stored in ``self._resolved`` keyed by param name.
         """
@@ -58,30 +61,32 @@ class ParamMixin:
 
             if raw is None:
                 if required:
-                    return {"message": f"URL parameter '{name}' is required"}, 400
+                    raise ApiError(400, f"URL parameter '{name}' is required")
                 continue
 
             # Coerce
             try:
                 value = coerce(raw)
             except (TypeError, ValueError):
-                return {"message": f"Invalid value for URL parameter '{name}'"}, 400
+                raise ApiError(400, f"Invalid value for URL parameter '{name}'") from None
 
             # Resolve
             resolver = (self.resolve_params or {}).get(name)
             if resolver is not None:
                 result = resolver(value)
-                # Resolver may return an error tuple
+                # Backward compatibility: a (payload, status) tuple is
+                # converted to an ApiError.
                 if isinstance(result, tuple):
-                    return result
+                    payload, status = result
+                    message = payload.get("message", "Error") if isinstance(payload, dict) else str(payload)
+                    errors = payload.get("errors") if isinstance(payload, dict) else None
+                    raise ApiError(status, message, errors=errors)
                 if result is None:
-                    return {"message": f"'{name}' {coerce.__name__} {value} not found"}, 404
+                    raise ApiError(404, f"'{name}' {coerce.__name__} {value} not found")
                 self._resolved[name] = result
             else:
                 # No resolver — just store the coerced value
                 self._resolved[name] = value
-
-        return None  # success
 
     def _parent_filters(self) -> dict:
         """Return a dict of ``{model_col: value}`` derived from resolved params.

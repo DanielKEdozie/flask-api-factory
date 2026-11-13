@@ -2,14 +2,17 @@ from __future__ import annotations
 
 from flask_sqlalchemy import SQLAlchemy
 from marshmallow import Schema, ValidationError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+
+from flask_api_factory.errors import ApiError
 
 
 class ApiService:
     """Lightweight CRUD service for a SQLAlchemy model + Marshmallow schema.
 
-    Every public method returns a ``(payload, status_code)`` tuple.
-    Success payloads are wrapped as ``{"data": ...}``; errors as
-    ``{"message": ..., "errors": ...}``.
+    Success payloads are wrapped as ``{"data": ...}`` and returned as
+    ``(payload, status_code)`` tuples. Errors raise :class:`ApiError`,
+    which the factory renders as a JSON envelope.
     """
 
     def __init__(self, db: SQLAlchemy, schema: Schema, model=None,
@@ -22,11 +25,11 @@ class ApiService:
 
     # ---- serialization -------------------------------------------------
 
-    def load(self, data):
+    def load(self, data, partial=False):
         try:
-            return self.schema.load(data)
+            return self.schema.load(data, partial=partial)
         except ValidationError as e:
-            return self.error(422, "Invalid data", e.messages)
+            raise ApiError(422, "Invalid data", errors=e.messages) from e
 
     def dump(self, data, many=False):
         return self.dump_schema.dump(data, many=many)
@@ -36,24 +39,27 @@ class ApiService:
     def _envelope_response(self, data):
         return {"data": data}
 
-    def _envelope_error(self, code, message, errors=None):
-        payload = {"message": message}
-        if errors:
-            payload["errors"] = errors
-        return payload, code
-
     def response(self, data, code=200):
         if isinstance(data, tuple):
             data, code = data
         return self._envelope_response(data), code
 
     def error(self, code, message, errors=None):
-        return self._envelope_error(code, message, errors)
+        """Raise an :class:`ApiError`. Kept for backward compatibility."""
+        raise ApiError(code, message, errors=errors)
 
     # ---- persistence ---------------------------------------------------
 
     def commit(self):
-        self.db.session.commit()
+        try:
+            self.db.session.commit()
+        except IntegrityError as e:
+            self.db.session.rollback()
+            detail = str(e.orig) if getattr(e, "orig", None) else str(e)
+            raise ApiError(409, "Conflict", errors={"detail": detail}) from e
+        except SQLAlchemyError as e:
+            self.db.session.rollback()
+            raise ApiError(500, "Database error", errors={"detail": str(e)}) from e
 
     def _get_obj(self, pk, pk_field='id'):
         obj = (
@@ -62,7 +68,7 @@ class ApiService:
             .first()
         )
         if not obj:
-            return self.error(404, f"{self.model.__name__} not found")
+            raise ApiError(404, f"{self.model.__name__} not found")
         return obj
 
     # ---- hooks ---------------------------------------------------------
@@ -94,11 +100,9 @@ class ApiService:
         if query is not None:
             obj = query.filter(getattr(self.model, pk_field) == pk).first()
             if not obj:
-                return self.error(404, f"{self.model.__name__} not found")
+                raise ApiError(404, f"{self.model.__name__} not found")
         else:
             obj = self._get_obj(pk, pk_field)
-        if isinstance(obj, tuple):
-            return obj
         return self.response(self.dump(obj))
 
     def list_all(self, query=None, paginate=False, page=1, per_page=10):
@@ -117,8 +121,6 @@ class ApiService:
     def create(self, data):
         self._execute_hook("before_load", data, mode="create")
         loaded_data = self.load(data)
-        if isinstance(loaded_data, tuple):
-            return loaded_data
         self._execute_hook("after_load", None, loaded_data, mode="create")
         obj = self.model(**loaded_data)
         self._execute_hook("before_commit", obj, loaded_data, mode="create")
@@ -126,14 +128,10 @@ class ApiService:
         self.commit()
         return self.response(self.dump(obj), 201)
 
-    def update(self, pk, data, pk_field='id'):
+    def update(self, pk, data, pk_field='id', partial=False):
         obj = self._get_obj(pk, pk_field)
-        if isinstance(obj, tuple):
-            return obj
         self._execute_hook("before_load", data, instance=obj, mode="update")
-        loaded_data = self.load(data)
-        if isinstance(loaded_data, tuple):
-            return loaded_data
+        loaded_data = self.load(data, partial=partial)
         self._execute_hook("after_load", obj, loaded_data, mode="update")
         for key, value in loaded_data.items():
             setattr(obj, key, value)
@@ -143,8 +141,6 @@ class ApiService:
 
     def delete(self, pk, pk_field='id'):
         obj = self._get_obj(pk, pk_field)
-        if isinstance(obj, tuple):
-            return obj
         self.db.session.delete(obj)
         self.commit()
         return self.response(None, 204)

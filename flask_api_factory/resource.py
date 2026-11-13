@@ -6,9 +6,10 @@ from flask import request
 from flask.views import MethodView
 from marshmallow import Schema
 
+from flask_api_factory.errors import ApiError
 from flask_api_factory.params import ParamMixin
 from flask_api_factory.pagination import PaginationMixin
-from flask_api_factory.querying import QueryingMixin
+from flask_api_factory.querying import FilterError, QueryingMixin
 from flask_api_factory.routing import RoutingMixin
 from flask_api_factory.service import ApiService
 
@@ -83,10 +84,7 @@ class ApiResource(RoutingMixin, ParamMixin, QueryingMixin, PaginationMixin, Meth
     def _resolve_kwargs(self, **kwargs):
         self._resolved = {}
         if self.route_params or self.resolve_params:
-            error = self._resolve_url_params(kwargs)
-            if error is not None:
-                return error
-        return None
+            self._resolve_url_params(kwargs)
 
     def _inject_parent_values(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         payload = dict(payload or {})
@@ -100,7 +98,10 @@ class ApiResource(RoutingMixin, ParamMixin, QueryingMixin, PaginationMixin, Meth
         return payload
 
     def _collection_get(self):
-        query = self._build_query()
+        try:
+            query = self._build_query()
+        except FilterError as exc:
+            raise ApiError(400, str(exc)) from exc
         page, per_page = self._pagination_params()
         paginate = self._should_paginate()
         return self.service.list_all(
@@ -111,43 +112,51 @@ class ApiResource(RoutingMixin, ParamMixin, QueryingMixin, PaginationMixin, Meth
         )
 
     def _detail_get(self, pk):
-        query = self._build_query()
+        try:
+            query = self._build_query()
+        except FilterError as exc:
+            raise ApiError(400, str(exc)) from exc
         return self.service.retrieve(pk, query=query, pk_field=self.pk_field)
 
     def get(self, **kwargs):
-        err = self._resolve_kwargs(**kwargs)
-        if err is not None:
-            return err
+        self._resolve_kwargs(**kwargs)
         pk = kwargs.get(self.pk_field)
         if pk is None:
             return self._collection_get()
         return self._detail_get(pk)
 
     def post(self, **kwargs):
-        err = self._resolve_kwargs(**kwargs)
-        if err is not None:
-            return err
+        if not self.allow_create:
+            raise ApiError(405, "Method not allowed")
+        self._resolve_kwargs(**kwargs)
         payload = self._inject_parent_values(request.get_json(silent=True) or {})
         return self.service.create(payload)
 
     def put(self, **kwargs):
-        err = self._resolve_kwargs(**kwargs)
-        if err is not None:
-            return err
+        if not self.allow_update:
+            raise ApiError(405, "Method not allowed")
+        self._resolve_kwargs(**kwargs)
         pk = kwargs.get(self.pk_field)
         if pk is None:
-            return {"message": f"Missing {self.pk_field}"}, 400
+            raise ApiError(400, f"Missing {self.pk_field}")
         payload = self._inject_parent_values(request.get_json(silent=True) or {})
-        return self.service.update(pk, payload, pk_field=self.pk_field)
+        return self.service.update(pk, payload, pk_field=self.pk_field, partial=False)
 
     def patch(self, **kwargs):
-        return self.put(**kwargs)
-
-    def delete(self, **kwargs):
-        err = self._resolve_kwargs(**kwargs)
-        if err is not None:
-            return err
+        if not self.allow_update:
+            raise ApiError(405, "Method not allowed")
+        self._resolve_kwargs(**kwargs)
         pk = kwargs.get(self.pk_field)
         if pk is None:
-            return {"message": f"Missing {self.pk_field}"}, 400
+            raise ApiError(400, f"Missing {self.pk_field}")
+        payload = self._inject_parent_values(request.get_json(silent=True) or {})
+        return self.service.update(pk, payload, pk_field=self.pk_field, partial=True)
+
+    def delete(self, **kwargs):
+        if not self.allow_delete:
+            raise ApiError(405, "Method not allowed")
+        self._resolve_kwargs(**kwargs)
+        pk = kwargs.get(self.pk_field)
+        if pk is None:
+            raise ApiError(400, f"Missing {self.pk_field}")
         return self.service.delete(pk, pk_field=self.pk_field)

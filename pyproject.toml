@@ -13,5 +13,10 @@ dependencies = [
     "marshmallow",
 ]
 
+[project.optional-dependencies]
+auth = [
+    "flask-auth-factory @ git+https://github.com/DanielKEdozie/flask-auth-factory.git",
+]
+
 [tool.setuptools]
 packages = ["flask_api_factory"]
