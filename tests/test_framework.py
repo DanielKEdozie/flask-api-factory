@@ -639,6 +639,81 @@ class FrameworkTestCase(unittest.TestCase):
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(len(resp.get_json()["data"]), 2)
 
+    def test_delete_hooks_fire_around_the_delete_commit(self):
+        events = []
+
+        class HookedWidgetResource(WidgetResource):
+            def before_delete(self, instance):
+                events.append(("before", instance.name, instance in db.session.deleted))
+                # Mapped attributes are expired after commit; keep a plain copy.
+                instance._deleted_name = instance.name
+
+            def after_delete(self, instance):
+                events.append(
+                    ("after", instance._deleted_name, instance in db.session.deleted)
+                )
+
+        self.api.register_resource(HookedWidgetResource, path="/hooked")
+        created = self.client.post(
+            "/api/hooked", json={"name": "delete-me"}
+        ).get_json()["data"]
+
+        resp = self.client.delete(f"/api/hooked/{created['id']}")
+
+        self.assertEqual(resp.status_code, 204)
+        self.assertEqual(
+            events,
+            [
+                ("before", "delete-me", False),
+                ("after", "delete-me", False),
+            ],
+        )
+        self.assertEqual(
+            self.client.get(f"/api/hooked/{created['id']}").status_code, 404
+        )
+
+    def test_before_delete_can_abort_with_api_error(self):
+        class GuardedWidgetResource(WidgetResource):
+            def before_delete(self, instance):
+                raise ApiError(403, "Deletion forbidden")
+
+        self.api.register_resource(GuardedWidgetResource, path="/guarded")
+        created = self.client.post(
+            "/api/guarded", json={"name": "keep-me"}
+        ).get_json()["data"]
+
+        resp = self.client.delete(f"/api/guarded/{created['id']}")
+
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.get_json()["message"], "Deletion forbidden")
+        self.assertEqual(
+            self.client.get(f"/api/guarded/{created['id']}").status_code, 200
+        )
+
+    def test_service_hook_map_is_used_for_delete(self):
+        calls = []
+
+        with self.app.app_context():
+            obj = Widget(name="service-hook")
+            db.session.add(obj)
+            db.session.commit()
+
+            svc = service.ApiService(
+                db=db,
+                schema=WidgetSchema(),
+                model=Widget,
+                hooks={
+                    "before_delete": lambda instance: calls.append("before"),
+                    "after_delete": lambda instance: calls.append("after"),
+                },
+            )
+            payload, code = svc.delete(obj.id)
+
+            self.assertEqual(code, 204)
+            self.assertIsNone(payload["data"])
+
+        self.assertEqual(calls, ["before", "after"])
+
     def test_unbound_resource_raises(self):
         class UnboundResource(ApiResource):
             schema = WidgetSchema

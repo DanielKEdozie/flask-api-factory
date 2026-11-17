@@ -110,7 +110,13 @@ to disable the endpoint, or `openapi_url="/docs/openapi.json"` to move it.
 - **Pagination** — `paginate`, `page_size`, `max_page_size`, `?paginate=`.
 - **Nesting** — use the parent registration handle's `nested_resource()`;
   legacy `params=[(...)]` routes remain supported.
-- **Hooks** — `before_load`, `after_load`, `before_commit`.
+- **Hooks** — `before_load`, `after_load`, `before_commit`, `before_delete`,
+  `after_delete`.
+
+`before_delete(instance)` runs before `session.delete()`; raise `ApiError`
+to abort the deletion. `after_delete(instance)` runs after the delete commits.
+Mapped attributes are expired after commit, so snapshot any values you need
+in `before_delete` if `after_delete` must read them.
 
 ## Tests
 

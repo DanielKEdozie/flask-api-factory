@@ -82,6 +82,8 @@ class ApiResource(RoutingMixin, ParamMixin, QueryingMixin, PaginationMixin, Meth
                 "before_load": self.before_load,
                 "after_load": self.after_load,
                 "before_commit": self.before_commit,
+                "before_delete": self.before_delete,
+                "after_delete": self.after_delete,
             },
         )
 
@@ -93,6 +95,20 @@ class ApiResource(RoutingMixin, ParamMixin, QueryingMixin, PaginationMixin, Meth
 
     def before_commit(self, instance, data, mode="create"):
         """Hook for resource-specific work before persistence."""
+
+    def before_delete(self, instance):
+        """Hook called with the ORM instance before it is deleted.
+
+        Raise :class:`ApiError` to abort.  Useful for authorization checks that
+        need the instance itself (e.g. checking an owner foreign key).
+        """
+
+    def after_delete(self, instance):
+        """Hook called with the deleted instance after the delete commits.
+
+        Mapped attributes are expired after commit; snapshot any values you
+        need in ``before_delete``.
+        """
 
     def _resolve_kwargs(self, **kwargs):
         self._resolved = {}

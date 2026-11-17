@@ -91,6 +91,22 @@ class ApiService:
         """Called after load and before commit; override to mutate the instance
         (e.g. hash a password) once it has been built/updated."""
 
+    def before_delete(self, instance):
+        """Called with the ORM instance just before ``session.delete()``.
+
+        Raise :class:`ApiError` (or any HTTP exception) to abort the deletion.
+        This is the natural place for authorization checks.
+        """
+
+    def after_delete(self, instance):
+        """Called with the deleted instance after the delete is committed.
+
+        Note: with ``expire_on_commit=True`` the instance's mapped attributes
+        are expired once the transaction commits.  Capture any values you need
+        in ``before_delete`` (e.g. on a plain Python attribute) if ``after_delete``
+        must read them.  Exceptions raised here do not roll back the delete.
+        """
+
     # ---- CRUD ----------------------------------------------------------
 
     def retrieve(self, pk, query=None, pk_field='id'):
@@ -138,6 +154,8 @@ class ApiService:
 
     def delete(self, pk, pk_field='id', query=None):
         obj = self._get_obj(pk, pk_field, query=query)
+        self._execute_hook("before_delete", obj)
         self.db.session.delete(obj)
         self.commit()
+        self._execute_hook("after_delete", obj)
         return self.response(None, 204)
