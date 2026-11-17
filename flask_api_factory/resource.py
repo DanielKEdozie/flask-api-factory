@@ -94,7 +94,11 @@ class ApiResource(RoutingMixin, ParamMixin, QueryingMixin, PaginationMixin, Meth
         """Hook for resource-specific behavior after schema validation."""
 
     def before_commit(self, instance, data, mode="create"):
-        """Hook for resource-specific work before persistence."""
+        """Hook for resource-specific work before persistence.
+
+        ``mode`` is ``"create"``, ``"update"``, or ``"delete"``; ``data`` is
+        ``None`` for deletes.
+        """
 
     def before_delete(self, instance):
         """Hook called with the ORM instance before it is deleted.

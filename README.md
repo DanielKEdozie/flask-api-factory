@@ -113,6 +113,10 @@ to disable the endpoint, or `openapi_url="/docs/openapi.json"` to move it.
 - **Hooks** — `before_load`, `after_load`, `before_commit`, `before_delete`,
   `after_delete`.
 
+`before_commit(instance, data, mode)` runs on create/update and on delete.
+For deletes, `mode="delete"` and `data=None`, and the instance is already
+staged via `session.delete()`.
+
 `before_delete(instance)` runs before `session.delete()`; raise `ApiError`
 to abort the deletion. `after_delete(instance)` runs after the delete commits.
 Mapped attributes are expired after commit, so snapshot any values you need

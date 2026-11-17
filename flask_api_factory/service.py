@@ -88,8 +88,12 @@ class ApiService:
         """Called after marshmallow load; override to react to loaded data."""
 
     def before_commit(self, instance, data, mode="create"):
-        """Called after load and before commit; override to mutate the instance
-        (e.g. hash a password) once it has been built/updated."""
+        """Called just before commit on create, update, and delete.
+
+        ``mode`` is ``"create"``, ``"update"``, or ``"delete"``. For deletes,
+        ``data`` is ``None`` and the instance is already staged via
+        ``session.delete()``.
+        """
 
     def before_delete(self, instance):
         """Called with the ORM instance just before ``session.delete()``.
@@ -156,6 +160,7 @@ class ApiService:
         obj = self._get_obj(pk, pk_field, query=query)
         self._execute_hook("before_delete", obj)
         self.db.session.delete(obj)
+        self._execute_hook("before_commit", obj, None, mode="delete")
         self.commit()
         self._execute_hook("after_delete", obj)
         return self.response(None, 204)

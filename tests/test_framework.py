@@ -648,6 +648,9 @@ class FrameworkTestCase(unittest.TestCase):
                 # Mapped attributes are expired after commit; keep a plain copy.
                 instance._deleted_name = instance.name
 
+            def before_commit(self, instance, data, mode="create"):
+                events.append(("before_commit", mode, data, instance in db.session.deleted))
+
             def after_delete(self, instance):
                 events.append(
                     ("after", instance._deleted_name, instance in db.session.deleted)
@@ -657,6 +660,7 @@ class FrameworkTestCase(unittest.TestCase):
         created = self.client.post(
             "/api/hooked", json={"name": "delete-me"}
         ).get_json()["data"]
+        events.clear()  # Ignore the create-phase before_commit call.
 
         resp = self.client.delete(f"/api/hooked/{created['id']}")
 
@@ -665,6 +669,7 @@ class FrameworkTestCase(unittest.TestCase):
             events,
             [
                 ("before", "delete-me", False),
+                ("before_commit", "delete", None, True),
                 ("after", "delete-me", False),
             ],
         )
@@ -704,6 +709,9 @@ class FrameworkTestCase(unittest.TestCase):
                 model=Widget,
                 hooks={
                     "before_delete": lambda instance: calls.append("before"),
+                    "before_commit": lambda instance, data, mode: calls.append(
+                        ("before_commit", mode, data)
+                    ),
                     "after_delete": lambda instance: calls.append("after"),
                 },
             )
@@ -712,7 +720,9 @@ class FrameworkTestCase(unittest.TestCase):
             self.assertEqual(code, 204)
             self.assertIsNone(payload["data"])
 
-        self.assertEqual(calls, ["before", "after"])
+        self.assertEqual(
+            calls, ["before", ("before_commit", "delete", None), "after"]
+        )
 
     def test_unbound_resource_raises(self):
         class UnboundResource(ApiResource):
